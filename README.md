@@ -19,7 +19,7 @@ pip install -r requirements.txt
 Start Command:
 
 ```text
-python api_desenvolva_lancamentos.py
+uvicorn api_desenvolva_lancamentos:app --host 0.0.0.0 --port $PORT
 ```
 
 Depois de publicar, teste:
