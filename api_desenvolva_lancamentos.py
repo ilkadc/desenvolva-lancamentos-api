@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import tempfile
 import uuid
 import zipfile
 from datetime import datetime
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
-import os
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from openpyxl import load_workbook
+from starlette.requests import Request
 
 from gerar_automacao_extratos import (
     OUT_DIR,
@@ -23,10 +22,20 @@ from gerar_automacao_extratos import (
 )
 
 
+app = FastAPI(title="Desenvolva Lançamentos API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 BASE = Path(__file__).resolve().parent
 CONTAS = BASE / "Contas.xls"
 MODELO_DOMINIO = BASE / "modelo_dominio.xlsm"
 JOBS_DIR = OUT_DIR / "api_jobs"
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORICOS = {
     "PAGAMENTO SIMPLES NACIONAL": (61, None),
@@ -40,22 +49,6 @@ def slug(text: str) -> str:
     text = text.lower()
     text = re.sub(r"[^a-z0-9]+", "_", text)
     return text.strip("_") or "arquivo"
-
-
-def add_cors(handler: BaseHTTPRequestHandler) -> None:
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
-
-
-def write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
-    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    add_cors(handler)
-    handler.end_headers()
-    handler.wfile.write(body)
 
 
 def period_label(period: dict) -> str:
@@ -250,103 +243,72 @@ def process_statement(pdf_path: Path, password: str, job_dir: Path) -> dict:
     }
 
 
-class DesenvolvaHandler(BaseHTTPRequestHandler):
-    server_version = "DesenvolvaLancamentosAPI/0.1"
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "produto": "Desenvolva Lançamentos"}
 
-    def do_OPTIONS(self):
-        self.send_response(HTTPStatus.NO_CONTENT)
-        add_cors(self)
-        self.end_headers()
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/health":
-            write_json(self, 200, {"status": "ok", "produto": "Desenvolva Lançamentos"})
-            return
+@app.post("/processar-extrato")
+async def processar_extrato(
+    request: Request,
+    arquivo: UploadFile = File(...),
+    senha: str = Form(""),
+) -> dict:
+    if not arquivo.filename:
+        raise HTTPException(status_code=400, detail="Arquivo do extrato nao enviado.")
 
-        if parsed.path.startswith("/download/"):
-            parts = parsed.path.strip("/").split("/")
-            if len(parts) != 3:
-                write_json(self, 404, {"erro": "Link de download invalido."})
-                return
-            _, job_id, filename = parts
-            file_path = (JOBS_DIR / job_id / filename).resolve()
-            if not str(file_path).startswith(str(JOBS_DIR.resolve())) or not file_path.exists():
-                write_json(self, 404, {"erro": "Arquivo nao encontrado."})
-                return
-            content = file_path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
-            self.send_header("Content-Length", str(len(content)))
-            add_cors(self)
-            self.end_headers()
-            self.wfile.write(content)
-            return
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
 
-        write_json(
-            self,
-            200,
-            {
-                "produto": "Desenvolva Lançamentos",
-                "rotas": ["GET /health", "POST /processar-extrato", "GET /download/{job}/{arquivo}"],
-            },
-        )
+    upload_name = slug(Path(arquivo.filename).stem) + Path(arquivo.filename).suffix.lower()
+    uploaded = job_dir / upload_name
+    temp_path = None
 
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path != "/processar-extrato":
-            write_json(self, 404, {"erro": "Rota nao encontrada."})
-            return
-
-        content_type = self.headers.get("Content-Type", "")
-        if "multipart/form-data" not in content_type:
-            write_json(self, 400, {"erro": "Envie multipart/form-data com o campo arquivo."})
-            return
-
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
-        )
-        file_field = form["arquivo"] if "arquivo" in form else None
-        if not file_field or not getattr(file_field, "filename", ""):
-            write_json(self, 400, {"erro": "Arquivo do extrato nao enviado."})
-            return
-
-        password = form.getfirst("senha", "")
-        job_id = uuid.uuid4().hex[:12]
-        job_dir = JOBS_DIR / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        upload_name = slug(Path(file_field.filename).stem) + Path(file_field.filename).suffix.lower()
-        uploaded = job_dir / upload_name
+    try:
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            shutil.copyfileobj(file_field.file, tmp)
+            shutil.copyfileobj(arquivo.file, tmp)
             temp_path = Path(tmp.name)
         shutil.move(str(temp_path), uploaded)
+        temp_path = None
 
-        try:
-            result = process_statement(uploaded, password, job_dir)
-        except Exception as exc:
-            write_json(self, 500, {"erro": "Falha ao processar extrato.", "detalhe": str(exc)})
-            return
+        result = process_statement(uploaded, senha, job_dir)
+    except Exception as exc:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+        raise HTTPException(
+            status_code=500,
+            detail={"erro": "Falha ao processar extrato.", "detalhe": str(exc)},
+        ) from exc
+    finally:
+        await arquivo.close()
 
-        base_url = f"http://{self.headers.get('Host', 'localhost:8000')}"
-        result["job_id"] = job_id
-        result["downloads"] = {
-            key: f"{base_url}/download/{job_id}/{filename}"
-            for key, filename in result["arquivos"].items()
-        }
-        write_json(self, 200, result)
-
-
-def run(host: str = "127.0.0.1", port: int = 8000) -> None:
-    JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer((host, port), DesenvolvaHandler)
-    print(f"Desenvolva Lançamentos API rodando em http://{host}:{port}")
-    server.serve_forever()
+    base_url = str(request.base_url).rstrip("/")
+    result["job_id"] = job_id
+    result["downloads"] = {
+        key: f"{base_url}/download/{job_id}/{filename}"
+        for key, filename in result["arquivos"].items()
+    }
+    return result
 
 
-if __name__ == "__main__":
-    run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+@app.get("/download/{job_id}/{arquivo}")
+def download(job_id: str, arquivo: str) -> FileResponse:
+    jobs_root = JOBS_DIR.resolve()
+    job_dir = (jobs_root / job_id).resolve()
+    file_path = (job_dir / arquivo).resolve()
+
+    try:
+        job_dir.relative_to(jobs_root)
+        file_path.relative_to(job_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Arquivo nao encontrado.") from exc
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Arquivo nao encontrado.")
+
+    return FileResponse(
+        file_path,
+        media_type="application/octet-stream",
+        filename=file_path.name,
+    )
